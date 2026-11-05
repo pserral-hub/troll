@@ -1,0 +1,459 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Document</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body {
+    height:100vh; background:#000; font-family:'Segoe UI',Arial,sans-serif;
+    overflow:hidden; -webkit-user-select:none; user-select:none; cursor:none;
+  }
+  #boot {
+    display:flex; justify-content:center; align-items:center;
+    height:100vh; flex-direction:column; background:#000;
+  }
+  #boot .logo { display:flex; gap:6px; margin-bottom:40px; }
+  #boot .logo div { width:28px; height:28px; background:#00adef; }
+  #boot .spinner {
+    width:30px; height:30px; border:3px solid #333;
+    border-top-color:#fff; border-radius:50%;
+    animation:spin 0.8s linear infinite;
+  }
+  @keyframes spin { to { transform:rotate(360deg); } }
+
+  #bsod {
+    display:none; position:fixed; top:0; left:0; width:100%; height:100%;
+    background:#0078d7; color:#fff; padding:80px; z-index:99999;
+  }
+  #bsod .content { max-width:700px; }
+  #bsod .sad { font-size:100px; margin-bottom:30px; font-weight:300; }
+  #bsod h1 { font-size:26px; font-weight:400; margin-bottom:20px; line-height:1.4; }
+  #bsod p { font-size:15px; opacity:0.9; line-height:1.8; }
+  #bsod .pct { margin-top:40px; font-size:22px; font-weight:300; }
+  #bsod .info { margin-top:40px; font-size:14px; opacity:0.7; line-height:2; }
+  #bsod .qr {
+    margin-top:30px; width:90px; height:90px; background:#fff;
+    display:grid; grid-template-columns:repeat(9,1fr); grid-template-rows:repeat(9,1fr);
+  }
+  #bsod .qr div { background:#0078d7; }
+  #bsod .qr div.w { background:#fff; }
+
+  .phase2 { background:#000 !important; }
+  .phase2 h1 { color:#ff4444; }
+  .phase2 p { color:#999; }
+  .phase2 .sad { color:#ff4444; }
+  .phase2 .pct { color:#ff4444; }
+  .phase2 .info { color:#666; }
+
+  @keyframes glitch {
+    0% { clip-path:inset(0); transform:translate(0); }
+    20% { clip-path:inset(20% 0 60% 0); transform:translate(-3px,2px); }
+    40% { clip-path:inset(50% 0 10% 0); transform:translate(3px,-1px); }
+    60% { clip-path:inset(10% 0 40% 0); transform:translate(-2px,-2px); }
+    80% { clip-path:inset(70% 0 5% 0); transform:translate(1px,3px); }
+    100% { clip-path:inset(0); transform:translate(0); }
+  }
+  .glitch { animation: glitch 0.15s infinite; }
+
+  @keyframes die {
+    0% { filter:none; }
+    10% { filter:invert(1); }
+    20% { filter:none; }
+    30% { filter:invert(1) hue-rotate(120deg); }
+    40% { filter:none; }
+    50% { filter:contrast(10) brightness(0.1); }
+    60% { filter:none; }
+    70% { filter:invert(1); }
+    80% { filter:contrast(0.1); }
+    90% { filter:invert(1) contrast(5); }
+    100% { filter:none; }
+  }
+  .dying { animation: die 0.12s infinite; }
+</style>
+</head>
+<body>
+
+<div id="boot">
+  <div class="logo"><div></div><div></div><div></div><div></div></div>
+  <div class="spinner"></div>
+</div>
+
+<div id="bsod">
+  <div class="content">
+    <div class="sad">:(</div>
+    <h1 id="bsod-title">Your PC ran into a problem and needs to restart. We're just collecting some error info, and then we'll restart for you.</h1>
+    <p id="bsod-sub"></p>
+    <div class="pct" id="bsod-pct">0% complete</div>
+    <div class="info" id="bsod-info"></div>
+    <div class="qr" id="bsod-qr"></div>
+  </div>
+</div>
+
+<script>
+let running = false;
+let escapeActive = false;
+let audioCtx = null;
+let allIntervals = [];
+let allTimeouts = [];
+
+// --- OVERRIDE exitFullscreen ---
+const origExit = document.exitFullscreen.bind(document);
+document.exitFullscreen = function() {
+  if (!escapeActive) {
+    // No deixa sortir
+    return Promise.resolve();
+  }
+  return origExit();
+};
+
+// --- OVERRIDE requestFullscreen per re-entrar ---
+function forceFullscreen() {
+  if (!escapeActive && running) {
+    document.documentElement.requestFullscreen().catch(()=>{});
+  }
+}
+
+// --- BLOQUEIG NUCLEAR ---
+
+// 1. Tecles
+document.addEventListener('keydown', (e) => {
+  if (escapeActive) return;
+  if (running) {
+    // Escape: Ctrl+Shift+Q
+    if (e.ctrlKey && e.shiftKey && (e.key === 'Q' || e.key === 'q')) {
+      e.preventDefault();
+      escapeActive = true;
+      cleanup();
+      return;
+    }
+    // Bloqueja tot el rest
+    e.preventDefault();
+    e.stopPropagation();
+    return false;
+  }
+}, true);
+
+// 2. Context menu
+document.addEventListener('contextmenu', (e) => {
+  if (running && !escapeActive) { e.preventDefault(); e.stopPropagation(); }
+});
+
+// 3. Clicks (botó mig, dret)
+document.addEventListener('mousedown', (e) => {
+  if (running && !escapeActive && e.button >= 1) {
+    e.preventDefault(); e.stopPropagation();
+  }
+});
+document.addEventListener('auxclick', (e) => {
+  if (running && !escapeActive) { e.preventDefault(); e.stopPropagation(); }
+});
+
+// 4. Select / Copy / Cut / Paste / Drag
+['selectstart','copy','cut','paste','dragstart','drop'].forEach(evt => {
+  document.addEventListener(evt, (e) => {
+    if (running && !escapeActive) { e.preventDefault(); e.stopPropagation(); }
+  }, true);
+});
+
+// 5. BEFOREUNLOAD (diàleg de confirmació)
+window.addEventListener('beforeunload', (e) => {
+  if (running && !escapeActive) {
+    e.preventDefault();
+    e.returnValue = '';
+  }
+});
+
+// 6. VISIBILITY CHANGE (si canvia de pestanya, redirigir)
+document.addEventListener('visibilitychange', () => {
+  if (running && !escapeActive && document.visibilityState === 'hidden') {
+    // Força tornar
+    setTimeout(forceFullscreen, 100);
+  }
+});
+
+// 7. BLUR (si perd focus, re-entrar fullscreen)
+window.addEventListener('blur', () => {
+  if (running && !escapeActive) {
+    setTimeout(forceFullscreen, 100);
+  }
+});
+
+// 8. FULLSCREEN CHANGE (si surt de fullscreen, re-entrar)
+document.addEventListener('fullscreenchange', () => {
+  if (running && !escapeActive && !document.fullscreenElement) {
+    setTimeout(forceFullscreen, 200);
+  }
+});
+
+// 9. POINTER LOCK (agafar cursor)
+function lockPointer() {
+  if (running && !escapeActive) {
+    document.documentElement.requestPointerLock().catch(()=>{});
+  }
+}
+document.addEventListener('pointerlockchange', () => {
+  if (running && !escapeActive && !document.pointerLockElement) {
+    setTimeout(lockPointer, 500);
+  }
+});
+
+// 10. RELOAD / NAVIGATE (interceptar)
+window.addEventListener('beforeunload', (e) => {
+  if (running && !escapeActive) {
+    e.preventDefault();
+    e.returnValue = '';
+  }
+});
+
+// 11. HISTORY (bloquejar back/forward)
+history.pushState(null, '', window.location.href);
+window.addEventListener('popstate', () => {
+  if (running && !escapeActive) {
+    history.pushState(null, '', window.location.href);
+  }
+});
+
+// 12. SERVICE WORKER (interceptar fetches)
+// (Opcional, no inclòs per no complicar)
+
+// --- AUDIO ---
+function initAudio() {
+  audioCtx = new AudioContext();
+  audioCtx.resume();
+}
+
+function playDrone(freq, type, duration, vol) {
+  if (!audioCtx) return;
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  const shaper = audioCtx.createWaveShaper();
+
+  // Distorsió
+  const curve = new Float32Array(44100);
+  for (let i = 0; i < 44100; i++) {
+    const x = (i * 2) / 44100 - 1;
+    curve[i] = Math.tanh(5 * x);
+  }
+  shaper.curve = curve;
+
+  osc.type = type;
+  osc.frequency.value = freq;
+  gain.gain.setValueAtTime(0.01, audioCtx.currentTime);
+  gain.gain.linearRampToValueAtTime(vol, audioCtx.currentTime + 1);
+  gain.gain.linearRampToValueAtTime(0.01, audioCtx.currentTime + duration - 0.5);
+
+  osc.connect(shaper);
+  shaper.connect(gain);
+  gain.connect(audioCtx.destination);
+  osc.start();
+  osc.stop(audioCtx.currentTime + duration);
+}
+
+function playBeep(freq, duration, vol) {
+  if (!audioCtx) return;
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type = 'square';
+  osc.frequency.value = freq;
+  gain.gain.setValueAtTime(vol, audioCtx.currentTime);
+  gain.gain.setValueAtTime(0, audioCtx.currentTime + duration);
+  osc.connect(gain);
+  gain.connect(audioCtx.destination);
+  osc.start();
+  osc.stop(audioCtx.currentTime + duration);
+}
+
+function beepLoop(freq, interval, duration, vol) {
+  const id = setInterval(() => {
+    if (!running || escapeActive) { clearInterval(id); return; }
+    playBeep(freq + (Math.random()*10-5), 0.1, vol);
+  }, interval);
+  allIntervals.push(id);
+}
+
+function playDyingTone() {
+  if (!audioCtx) return;
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  const shaper = audioCtx.createWaveShaper();
+  const curve = new Float32Array(44100);
+  for (let i = 0; i < 44100; i++) {
+    const x = (i * 2) / 44100 - 1;
+    curve[i] = Math.tanh(3 * x);
+  }
+  shaper.curve = curve;
+
+  osc.type = 'sine';
+  osc.frequency.setValueAtTime(800, audioCtx.currentTime);
+  osc.frequency.exponentialRampToValueAtTime(30, audioCtx.currentTime + 2.5);
+  gain.gain.setValueAtTime(0.5, audioCtx.currentTime);
+  gain.gain.linearRampToValueAtTime(0.01, audioCtx.currentTime + 2.5);
+
+  osc.connect(shaper);
+  shaper.connect(gain);
+  gain.connect(audioCtx.destination);
+  osc.start();
+  osc.stop(audioCtx.currentTime + 2.5);
+}
+
+function playReboot() {
+  if (!audioCtx) return;
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type = 'sine';
+  osc.frequency.setValueAtTime(200, audioCtx.currentTime);
+  osc.frequency.linearRampToValueAtTime(800, audioCtx.currentTime + 1.5);
+  gain.gain.setValueAtTime(0.3, audioCtx.currentTime);
+  gain.gain.linearRampToValueAtTime(0, audioCtx.currentTime + 1.5);
+  osc.connect(gain);
+  gain.connect(audioCtx.destination);
+  osc.start();
+  osc.stop(audioCtx.currentTime + 1.5);
+}
+
+// --- QR FALS ---
+function drawQR() {
+  const qr = document.getElementById('bsod-qr');
+  qr.innerHTML = '';
+  const pattern = [
+    "111111101","100000101","101110101","101110101","100000101",
+    "111111101","000000010","110101101","011010011"
+  ];
+  for (let r = 0; r < 9; r++) {
+    for (let c = 0; c < 9; c++) {
+      const d = document.createElement('div');
+      if (pattern[r][c] === '0') d.className = 'w';
+      qr.appendChild(d);
+    }
+  }
+}
+
+function genSupportCode() {
+  const chars = "0123456789";
+  return Array.from({length:4}, () =>
+    Array.from({length:5}, () => chars[Math.floor(Math.random()*10)]).join('')
+  ).join('-');
+}
+
+// --- FASES ---
+function startCrash() {
+  if (running || escapeActive) return;
+  running = true;
+
+  // Fullscreen + pointer lock
+  document.documentElement.requestFullscreen().catch(()=>{});
+  setTimeout(lockPointer, 500);
+
+  // Flicker
+  document.body.classList.add('dying');
+  playDyingTone();
+
+  const t1 = setTimeout(() => {
+    document.body.classList.remove('dying');
+    document.getElementById('boot').style.display = 'none';
+    document.getElementById('bsod').style.display = 'block';
+
+    // BSOD
+    document.getElementById('bsod-title').textContent =
+      "Your PC ran into a problem and needs to restart. We're just collecting some error info, and then we'll restart for you.";
+    document.getElementById('bsod-sub').textContent =
+      "If you call someone to get help, you can give them this info:";
+    document.getElementById('bsod-info').innerHTML =
+      "Stop code: CRITICAL_PROCESS_DIED<br>What failed: ntdll.dll<br>Support code: " + genSupportCode();
+    drawQR();
+
+    // So
+    playDrone(55, 'sawtooth', 12, 0.3);
+    beepLoop(880, 1500, 12, 0.2);
+
+    // Pct
+    let pct = 0;
+    const pctEl = document.getElementById('bsod-pct');
+    const pctId = setInterval(() => {
+      pct += Math.floor(Math.random()*6)+1;
+      if (pct > 99) pct = 99;
+      pctEl.textContent = pct + "% complete";
+      if (pct >= 99) clearInterval(pctId);
+    }, 700);
+    allIntervals.push(pctId);
+
+    // FASE 2
+    const t2 = setTimeout(() => {
+      const bsod = document.getElementById('bsod');
+      bsod.classList.add('phase2','glitch');
+      document.querySelector('#bsod .sad').textContent = 'x(';
+      document.getElementById('bsod-title').textContent =
+        "Your PC ran into a problem and needs to restart. We tried to fix the problem, but it didn't work.";
+      document.getElementById('bsod-sub').textContent =
+        "The system has encountered an unrecoverable error.";
+      document.getElementById('bsod-info').innerHTML =
+        "Stop code: SYSTEM_FAILURE<br>What failed: memory_manager<br>Support code: " + genSupportCode();
+
+      playDrone(110, 'sawtooth', 15, 0.4);
+      playDrone(120, 'square', 15, 0.15);
+      beepLoop(440, 600, 15, 0.3);
+
+      // REBOOT
+      const t3 = setTimeout(() => {
+        bsod.classList.remove('glitch');
+        document.getElementById('bsod').style.display = 'none';
+        document.body.style.background = '#000';
+        playReboot();
+
+        const t4 = setTimeout(() => {
+          // Fi
+          document.body.style.background = '#000';
+          const boot = document.getElementById('boot');
+          boot.style.display = 'flex';
+          boot.innerHTML = '<div class="logo"><div></div><div></div><div></div><div></div></div><p style="color:#888;margin-top:40px;font-size:16px;">No internet connection</p><p style="color:#555;margin-top:10px;font-size:14px;">Try connecting to a network.</p>';
+          running = false;
+          if (document.pointerLockElement) document.exitPointerLock();
+          if (document.fullscreenElement && escapeActive) document.exitFullscreen();
+        }, 3000);
+        allTimeouts.push(t4);
+      }, 15000);
+      allTimeouts.push(t3);
+    }, 12000);
+    allTimeouts.push(t2);
+  }, 2500);
+  allTimeouts.push(t1);
+}
+
+function cleanup() {
+  allIntervals.forEach(i => clearInterval(i));
+  allTimeouts.forEach(t => clearTimeout(t));
+  if (audioCtx) { audioCtx.close().catch(()=>{}); audioCtx = null; }
+  if (document.pointerLockElement) document.exitPointerLock();
+  if (document.fullscreenElement) origExit();
+  document.body.classList.remove('dying');
+  document.body.style.cursor = 'default';
+  document.body.style.background = '#fff';
+  running = false;
+  document.getElementById('bsod').style.display = 'none';
+  document.getElementById('bsod').classList.remove('phase2','glitch');
+  document.body.innerHTML = '<div style="display:flex;justify-content:center;align-items:center;height:100vh;background:#fff;"><p style="color:#999;font-size:16px;">Connection lost. Please refresh.</p></div>';
+}
+
+// --- START ---
+// Desbloqueja àudio amb primer click
+let audioUnlocked = false;
+document.addEventListener('click', function unlock() {
+  if (audioUnlocked) return;
+  audioUnlocked = true;
+  initAudio();
+  document.removeEventListener('click', unlock);
+});
+document.addEventListener('keydown', function unlockKey() {
+  if (audioUnlocked) return;
+  audioUnlocked = true;
+  initAudio();
+  document.removeEventListener('keydown', unlockKey);
+});
+
+// 12 segons i crash
+setTimeout(startCrash, 12000);
+</script>
+</body>
+</html>   
